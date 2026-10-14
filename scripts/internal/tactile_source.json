@@ -1,0 +1,23 @@
+{
+  "repository": "https://github.com/univtac/UniVTAC.git",
+  "revision": "d541e5568227ca3b66104d294f63c80acad7c52c",
+  "subdirectory": "third_party/TacEx",
+  "upstream_baseline": {
+    "tacex": "f2051944e469a961241271fbf6fb60e272fc336b",
+    "libuipc": "1a7e93ef68765e4d3c15d5583f5c387e89af5183",
+    "muda": "8f9e17d8e76a658df3b6ffeeffbbc9ac47ac54bf",
+    "SymEigen": "c72a0082e44b3b8062727b25c33ce7450f9fa933"
+  },
+  "vcpkg_repository": "https://github.com/microsoft/vcpkg.git",
+  "vcpkg_revision": "dd3097e305afa53f7b4312371f62058d2e665320",
+  "patches": [
+    "tactile_patches/robodojo.patch",
+    "tactile_patches/fem_optics.patch"
+  ],
+  "license_notes": [
+    "Preserve UniVTAC/LICENSE and TacEx/UNIVTAC_BASELINE.md. TacEx's pinned upstream README and setup metadata declare MIT, but that revision has no root LICENSE file.",
+    "The pinned libuipc root LICENSE is Apache-2.0; libuipc/python/LICENSE and Python package metadata declare GPLv3. These are separate upstream declarations, not a compatibility conclusion.",
+    "Retain the nested Taxim, pix2pix, muda and other component notices and source headers. RoboDojo patches do not replace upstream licenses.",
+    "Only GelSight Mini assets are selected; unused robot/prop assets, other sensors and the optional pix2pix checkpoint are not downloaded."
+  ]
+}

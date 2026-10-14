@@ -5,6 +5,7 @@ Tiled capture manager: initializes tiled render products and annotators for eval
 from copy import deepcopy
 from typing import List
 
+from isaacsim.core.utils.stage import get_current_stage
 from isaacsim.sensors.camera import Camera
 from omegaconf import DictConfig, OmegaConf
 from omni.replicator.core.scripts.annotators import Annotator
@@ -45,6 +46,7 @@ class TiledCaptureManager:
         # Pre-allocated output buffers for each camera and annotator to reduce memory allocation
         # Format: {cam_id: {annotator_name: wp.array}}
         self._output_buffers: dict = {}
+        self._capture_identity = None
 
     def initialize(self, sim: IsaacRLEnv):
         """
@@ -105,6 +107,9 @@ class TiledCaptureManager:
             height, width = camera_resolution[1], camera_resolution[0]
             tiled_camera = CameraView(
                 prim_paths_by_cam_id,
+                # HydraTexture.destroy removes graph paths by string prefix.
+                # Distinct names avoid the default base/base_01 collision.
+                name=f"robodojo_camera_{cam_id}",
                 camera_resolution=[width, height],
                 output_annotators=self.annotator_type[cam_id],
             )
@@ -176,12 +181,40 @@ class TiledCaptureManager:
     def reset(
         self,
     ):
-        """
-        Soft Reset do not need to reset the replicator writer and camera.
-        Only Hard Reset need which means if we reset simulation backend we need to initialize camera again
-        Since Render product change, we also need to attch a new writer maybe
-        """
+        """Reuse products across soft resets of the same cameras and stage."""
+        self.cameras = self.camera_manager.cameras
+        self.camera_names = self.camera_manager.camera_names
+        self.num_cams = len(self.cameras[0])
+        stage = get_current_stage()
+        identity = (
+            stage,
+            tuple(tuple((camera.prim_path, tuple(camera._resolution)) for camera in row) for row in self.cameras),
+            tuple(tuple(row) for row in self.camera_names),
+            OmegaConf.to_yaml(self.config.annotator, resolve=True),
+        )
+        if identity == self._capture_identity and all(
+            stage.GetPrimAtPath(product.path).IsValid() for product in self.tiled_render_products
+        ):
+            return
+        self._release_tiled_cameras()
         self.init_cameras()
+        self._capture_identity = identity
+
+    def _release_tiled_cameras(self):
+        # Detach every graph user before deleting any Hydra product. Product
+        # destruction may remove shared/dependent SDG nodes immediately.
+        for tiled_camera in self.tiled_cameras:
+            tiled_camera._detach_annotators()
+        for tiled_camera in self.tiled_cameras:
+            tiled_camera._clean_up_tiled_sensor()
+        self.tiled_render_products.clear()
+        self.tiled_cameras.clear()
+        self.annotator.clear()
+        self.annotator_type.clear()
+        self.annotator_device.clear()
+        self._output_buffers.clear()
+        self.camera_prim_paths.clear()
+        self._capture_identity = None
 
     def destroy(self):
         """
@@ -189,13 +222,8 @@ class TiledCaptureManager:
         This function will be called when we close the environment.
         """
 
-        self.annotator.clear()
-        self.annotator_type.clear()
-        self.annotator_device.clear()
-        self.tiled_cameras.clear()
-        self.cameras.clear()
-        self.camera_names.clear()
+        self._release_tiled_cameras()
+        # Release our aliases without clearing CameraManager's live lists.
+        self.cameras = []
+        self.camera_names = []
         self.sim = None
-        for rp in self.tiled_render_products:
-            rp.destroy()
-        self.camera_prim_paths.clear()

@@ -1,0 +1,52 @@
+# Source X5A fingertip pads on the left arm; reuse the native dual-arm layouts.
+config_name: arx_x5
+config:
+  sim: sim_config
+  scene: default
+  robot: dual_x5_pad
+  camera: camera_config
+tactile:
+  enabled: true
+  render_in_vision: true
+  sensor_type: gsmini
+  optical_backend: taxim
+  optical_input: object
+  collision_detection_method: stackless_bvh
+  resolution: [240, 320]
+  update_hz: 30
+  device: cuda
+  d_hat: 0.0001
+  allow_surface_repair: true
+  max_surface_error: 0.0003
+  max_initial_pose_correction_m: 0.001
+  left:
+    mounting: surface
+    body_name: link7
+    calibration_id: x5_pad_left_gsmini_response
+    rigid_body_prim_path: /World/envs/env_.*/robot0
+    gelpad_prim_path: /World/envs/env_.*/robot0/link7/gelpad_left
+    sensor_prim_path: /World/envs/env_.*/robot0/link7/gelsight_left
+    optical_field_mm: [20.4, 15.3]
+    camera_clipping_range: [0.027, 0.034]
+    camera_focus_distance: 0.028
+  right:
+    mounting: surface
+    body_name: link8
+    calibration_id: x5_pad_right_gsmini_response
+    rigid_body_prim_path: /World/envs/env_.*/robot0
+    gelpad_prim_path: /World/envs/env_.*/robot0/link8/gelpad_right
+    sensor_prim_path: /World/envs/env_.*/robot0/link8/gelsight_right
+    optical_field_mm: [20.4, 15.3]
+    camera_clipping_range: [0.027, 0.034]
+    camera_focus_distance: 0.028
+observation:
+  collect_freq: 25
+  robot:
+    joint_states: true
+    world_ee_state: true
+  vision:
+    approximate_depth: false
+    depth: false
+    intrinsic_matrix: false
+    extrinsic_matrix: false
+    shape: true

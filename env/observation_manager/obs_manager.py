@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from copy import deepcopy
 from typing import List
 
@@ -67,6 +68,10 @@ class ObsManager:
             self.camera_manager = env.camera_manager
         else:
             self.camera_manager = None
+        if hasattr(env, "tactile_manager"):
+            self.tactile_manager = env.tactile_manager
+        else:
+            self.tactile_manager = None
 
         self.initialize_instruction()
 
@@ -83,6 +88,23 @@ class ObsManager:
 
         Call this instead of a bare ``env.render()`` right before ``get_obs``.
         """
+        if self._tactile_active():
+            # The previous ordinary-camera pass may have shown sensor meshes.
+            # Restore optical visibility and fence that state before depth is
+            # consumed by tactile capture, without advancing physics.
+            self.tactile_manager.render_for_tactile(self._render_camera_frame)
+        else:
+            self._render_camera_frame()
+
+    def _tactile_active(self):
+        return (
+            self.tactile_manager is not None
+            and self.tactile_manager.enabled
+            and self.tactile_manager.initialized
+            and not self.tactile_manager.suspended
+        )
+
+    def _render_camera_frame(self):
         from env.camera_manager.capture.render_sync import wait_for_latest_cameras
 
         wait_for_latest_cameras(
@@ -106,27 +128,64 @@ class ObsManager:
                 "frequency": self.collect_freq,
             }
             obs[env_idx]["instruction"] = self.instruction[env_idx]
+            env = getattr(self, "env", None)
+            if env is not None:
+                episode_ids = getattr(env, "episode_ids", [])
+                if episode_ids:
+                    obs[env_idx]["episode_id"] = episode_ids[env_idx]
+                physics_step = int(getattr(env.sim, "_sim_step_counter", 0))
+                obs[env_idx]["physics_step"] = physics_step
+                obs[env_idx]["sim_time"] = physics_step * float(env.sim.physics_dt)
+
+        tactile_active = self._tactile_active()
+        if tactile_active:
+            # Freeze the optical capture and reference before the ordinary
+            # camera pass changes visibility or rewrites backend buffers.
+            self.tactile_manager.capture(dt=self.dt)
+            tactile_data = self.tactile_manager.observe(env_ids=env_idx_list)
+            for env_idx in env_idx_list:
+                tactile = tactile_data.get(
+                    int(env_idx),
+                    {
+                        "left": {"rgb": None, "valid": False},
+                        "right": {"rgb": None, "valid": False},
+                    },
+                )
+                obs[env_idx]["tactile"] = deepcopy(tactile)
         if self.camera_manager is not None and self.capture_manager is not None:
             try:
-                data = self.capture_manager.step(env_ids=env_idx_list)
-                for ith in range(self.camera_manager.num_cams):
-                    cam_data = data[ith]
-                    for annotator_name, env_list in cam_data.items():
-                        collect_name = self.ANNOTATORS_TO_COLLECT[annotator_name]
-                        for idx, env_idx in enumerate(env_idx_list):
-                            camera_name = self.camera_manager.camera_names[env_idx][ith]
-                            if camera_name not in obs[env_idx]["vision"]:
-                                obs[env_idx]["vision"][camera_name] = dict()
-                            obs[env_idx]["vision"][camera_name][collect_name] = env_list[idx]["data"]
+                visibility = (
+                    self.tactile_manager.vision_render_pass()
+                    if self.tactile_manager is not None
+                    else nullcontext(False)
+                )
+                with visibility as needs_render:
+                    if needs_render:
+                        # A separate render applies ordinary-camera visibility
+                        # at this same physics step. Tactile data stays frozen.
+                        self._render_camera_frame()
+                    data = self.capture_manager.step(env_ids=env_idx_list)
+                    for ith in range(self.camera_manager.num_cams):
+                        cam_data = data[ith]
+                        for annotator_name, env_list in cam_data.items():
+                            collect_name = self.ANNOTATORS_TO_COLLECT[annotator_name]
+                            for idx, env_idx in enumerate(env_idx_list):
+                                camera_name = self.camera_manager.camera_names[env_idx][ith]
+                                if camera_name not in obs[env_idx]["vision"]:
+                                    obs[env_idx]["vision"][camera_name] = dict()
+                                image = env_list[idx]["data"]
+                                if tactile_active and annotator_name != "rgb":
+                                    image = deepcopy(image)
+                                obs[env_idx]["vision"][camera_name][collect_name] = image
 
-                            if annotator_name == "rgb":
-                                obs[env_idx]["vision"][camera_name][collect_name] = obs[env_idx]["vision"][camera_name][
-                                    collect_name
-                                ][:, :, :3]
-                                if self.collect_shape:
-                                    obs[env_idx]["vision"][camera_name]["shape"] = obs[env_idx]["vision"][camera_name][
+                                if annotator_name == "rgb":
+                                    obs[env_idx]["vision"][camera_name][collect_name] = obs[env_idx]["vision"][camera_name][
                                         collect_name
-                                    ].shape
+                                    ][:, :, :3].copy()
+                                    if self.collect_shape:
+                                        obs[env_idx]["vision"][camera_name]["shape"] = obs[env_idx]["vision"][camera_name][
+                                            collect_name
+                                        ].shape
 
             except Exception as e:
                 import traceback

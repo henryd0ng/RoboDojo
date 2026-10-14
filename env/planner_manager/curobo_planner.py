@@ -1,4 +1,5 @@
 from copy import deepcopy
+from pathlib import Path
 
 from curobo.batch_motion_planner import BatchMotionPlanner, MotionPlannerCfg
 from curobo.inverse_kinematics import InverseKinematics, InverseKinematicsCfg
@@ -43,6 +44,12 @@ class CuroboPlanner:
         # translate from baselink to arm's base
         with open(self.yml_path) as f:
             yml_data = yaml.safe_load(f)
+        config_dir = Path(self.yml_path).resolve().parent
+        kinematics = yml_data.get("robot_cfg", {}).get("kinematics", {})
+        for key in ("urdf_path", "asset_root_path"):
+            value = kinematics.get(key)
+            if value and not Path(value).is_absolute():
+                kinematics[key] = str((config_dir / value).resolve())
         self.frame_bias = yml_data["planner"]["frame_bias"]
 
         self.robot_cfg, self.scene_model = self._build_robot_and_scene_cfg(yml_data, table_height)

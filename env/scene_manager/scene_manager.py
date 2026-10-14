@@ -113,6 +113,8 @@ class SceneManager:
     def initialize(self, sim: IsaacRLEnv):
         """Initialize the scene manager."""
         self.sim = sim
+        # DirectRLEnv may replace the stage after this manager was constructed.
+        self.stage = get_current_stage()
         self.env_origins = self.sim.scene.env_origins
 
         self._setup_background()
@@ -191,7 +193,7 @@ class SceneManager:
             if self._tables[env_idx] is not None:
                 self._tables[env_idx].relocate_offscreen()
 
-    def apply_saved_poses(self, env_idx_list: List[int]):
+    def apply_saved_poses(self, env_idx_list: List[int], *, settle_steps: int = 20):
         """Restore all scene objects to their saved eval-layout poses.
 
         Tables are applied first so support surfaces are in place, then rigid,
@@ -203,7 +205,7 @@ class SceneManager:
             if self._tables[env_idx] is not None:
                 self._tables[env_idx].apply_saved_pose()
 
-        for _ in range(20):  # waiting for tables to settle down
+        for _ in range(settle_steps):
             self.sim.sim_step(render=False)
 
         for env_idx in env_idx_list:
@@ -217,7 +219,7 @@ class SceneManager:
                 for obj in obj_dict.values():
                     obj.apply_saved_pose()
 
-        for _ in range(20):
+        for _ in range(settle_steps):
             self.sim.sim_step(render=False)
 
     def reload_env_scene(self, env_id: int, object_types: List[str] = None):

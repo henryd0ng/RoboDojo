@@ -66,6 +66,9 @@ args_cli = parser.parse_args()
 # Safe to import before AppLauncher: env is a namespace package (no __init__)
 # and GLOBAL_CONFIGS only imports os, so this pulls in no app-dependent code.
 from env.global_configs import BENCHMARK, ROOT_DIR
+from src.eval_client.config import build_eval_config, eval_run_overrides
+
+eval_run_overrides()
 
 task_registry = importlib.import_module(f"task.{BENCHMARK}.task_registry")
 
@@ -129,22 +132,9 @@ add_zero_delay_kit_args(args_cli)
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-from omegaconf import OmegaConf
-
 from env.global_configs import *
 from src.eval_client.eval_env import create_eval_env
 from utils.cluttered_generator import UnStableError
-from utils.load_file import load_yaml
-from utils.pipeline_utils import *
-
-BENCHMARK_PATH = os.path.join(ROOT_DIR, "task", BENCHMARK)
-
-
-def _eval_batch_from_deploy(policy_name):
-    deploy_yml_path = os.path.join(ROOT_DIR, "XPolicyLab", "policy", policy_name, "deploy.yml")
-    deploy_yml = load_yaml(deploy_yml_path) if os.path.isfile(deploy_yml_path) else {}
-    return bool(deploy_yml.get("eval_batch", False))
-
 
 def _resume_manifest_path(eval_cfg, run_id):
     """Mirror of EvalEnv.resume_manifest_path() so we can load BEFORE
@@ -152,7 +142,7 @@ def _resume_manifest_path(eval_cfg, run_id):
     the writer and reader paths.
     """
     return os.path.join(
-        "eval_result",
+        eval_cfg.get("output_root", "eval_result"),
         BENCHMARK,
         eval_cfg["task_name"],
         eval_cfg["policy_name"],
@@ -208,7 +198,52 @@ def _close_model_client(env):
         print(f"[main] failed to close model client: {e}")
 
 
-def _restart_or_exit(env, simulation_app, fatal_msg):
+def _finish_evaluation(env, simulation_app, close_application, original_error=None):
+    """Close the application even when environment cleanup raises."""
+    errors = [] if original_error is None else [original_error]
+    if original_error is not None:
+        # Kit may exit inside close(), so establish failure status first.
+        try:
+            simulation_app.app.post_quit(1)
+        except BaseException as error:
+            errors.append(error)
+    if env is not None:
+        try:
+            _close_model_client(env)
+        except BaseException as error:
+            errors.append(error)
+        try:
+            env.close()
+        except BaseException as error:
+            errors.append(error)
+    if errors and original_error is None:
+        # A normal run whose final cleanup failed must also exit unsuccessfully.
+        try:
+            simulation_app.app.post_quit(1)
+        except BaseException as error:
+            errors.append(error)
+    # Kit may terminate the process inside App.close(). Emit the failures while
+    # stderr is still available, rather than relying on a later Python raise.
+    if errors:
+        import traceback
+
+        for error in tuple(errors):
+            try:
+                traceback.print_exception(error, file=sys.stderr)
+            except BaseException as reporting_error:
+                errors.append(reporting_error)
+    for operation in (sys.stdout.flush, sys.stderr.flush, close_application):
+        try:
+            operation()
+        except BaseException as error:
+            errors.append(error)
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise BaseExceptionGroup("Evaluation and shutdown failed", errors) from None
+
+
+def _restart_or_exit(env, close_application, fatal_msg):
     """Persist progress and either os.execv-restart or sys.exit(99).
 
     Bounded by ROBODOJO_FATAL_RESTART_COUNT env var so a persistent hardware
@@ -225,7 +260,7 @@ def _restart_or_exit(env, simulation_app, fatal_msg):
         f"In-process restart attempt {restart_count}/{MAX_INPROC_RESTARTS}."
     )
     try:
-        simulation_app.close()
+        close_application()
     except Exception:
         pass
     if restart_count <= MAX_INPROC_RESTARTS:
@@ -251,99 +286,16 @@ def _exit_for_shell_restart(env, fatal_msg):
     os._exit(99)
 
 
-def main():
+def _run_evaluation(lifecycle, close_application):
     """Assemble the env config, build the eval env, and run the eval loop with
     PhysX crash/resume recovery until the requested episode count is reached.
     """
-    task_name = args_cli.task_name
-    num_envs = args_cli.num_envs
-    eval_cfg_name = args_cli.env_cfg_type
-    eval_cfg = load_yaml(os.path.join(ENV_CONFIG_PATH, eval_cfg_name + ".yml"))
-    eval_cfg["task_name"] = task_name
-    eval_cfg["num_envs"] = num_envs
-    eval_cfg["device_id"] = args_cli.device_id
-    eval_batch = _eval_batch_from_deploy(args_cli.policy_name)
-    eval_cfg["eval_batch"] = eval_batch
-    eval_cfg["policy_name"] = args_cli.policy_name
-    eval_cfg["additional_info"] = args_cli.additional_info
-    eval_cfg["seed"] = args_cli.seed
-    eval_cfg["physx_monitor_enabled"] = enable_monitor
-
-    deploy_cfg = {}
-    deploy_cfg["policy_name"] = args_cli.policy_name
-    deploy_cfg["port"] = args_cli.port
-    deploy_cfg["host"] = args_cli.host
-    deploy_cfg["protocol"] = args_cli.protocol
-    deploy_cfg["policy_server_url"] = args_cli.policy_server_url or f"ws://{args_cli.host}:{args_cli.port}"
-    deploy_cfg["evaluation_id"] = os.environ["ROBODOJO_RUN_ID"]
-    deploy_cfg["trial_id"] = f"{task_name}-{os.environ['ROBODOJO_RUN_ID']}"
-    deploy_cfg["action_case_id"] = f"{task_name}_case"
-    deploy_cfg["repeat_index"] = None
-    env_cfg = OmegaConf.create(
-        {
-            "sim": load_yaml(os.path.join(ENV_CONFIG_PATH, "sim", eval_cfg["config"]["sim"] + ".yml")),
-            "scene": load_yaml(
-                os.path.join(
-                    ENV_CONFIG_PATH,
-                    "scene",
-                    eval_cfg["config"]["scene"] + ".yml",
-                )
-            ),
-            "camera": load_yaml(
-                os.path.join(
-                    ENV_CONFIG_PATH,
-                    "camera",
-                    eval_cfg["config"]["camera"] + ".yml",
-                )
-            ),
-            "robot": load_yaml(
-                os.path.join(
-                    ENV_CONFIG_PATH,
-                    "robot",
-                    eval_cfg["config"]["robot"] + ".yml",
-                )
-            ),
-            "task_env": load_yaml(task_registry.task_config_path(os.path.join(BENCHMARK_PATH, "config"), task_name)),
-            "eval_cfg": eval_cfg,
-            "deploy_cfg": deploy_cfg,
-        }
-    )
-    capped_num_envs = resolve_random_task_num_envs(task_name, num_envs, env_cfg.sim)
-    if capped_num_envs != num_envs:
-        print(
-            f"[main] Random task {task_name}: num_envs capped "
-            f"{num_envs} -> {capped_num_envs} "
-        )
-    num_envs = capped_num_envs
-    if not eval_batch and num_envs != 1:
-        print(
-            f"[main] eval_batch=false in XPolicyLab/policy/{args_cli.policy_name}/deploy.yml; "
-            f"forcing num_envs {num_envs} -> 1"
-        )
-        num_envs = 1
-    eval_cfg["num_envs"] = num_envs
-    OmegaConf.update(env_cfg, "sim.scene.num_envs", num_envs, force_add=True)
-    OmegaConf.update(env_cfg, "eval_cfg.num_envs", num_envs, force_add=True)
-    env_cfg = process_randomization(env_cfg)
-    env_cfg, eval_num = process_config(env_cfg, task_name=task_name)
-
-    if os.environ.get("EVAL_NUM"):
-        _env_eval_num = os.environ.get("EVAL_NUM")
-        if str(_env_eval_num).lower() != "native":
-            eval_num = min(int(_env_eval_num), int(eval_num))
-    eval_cfg["eval_num"] = eval_num
-
-    OmegaConf.update(
-        env_cfg,
-        "camera.default_frequency",
-        eval_cfg["observation"].get("collect_freq", 0),
-        force_add=True,
-    )
-
-    env_cfg.sim.seed = [0 for _ in range(num_envs)]
+    env_cfg, eval_num = build_eval_config(args_cli, physx_monitor_enabled=enable_monitor)
+    eval_cfg = env_cfg.eval_cfg
     run_id = os.environ["ROBODOJO_RUN_ID"]
     resume_state = _load_resume_manifest(eval_cfg, run_id)
     env = create_eval_env(env_cfg, simulation_app, resume_state=resume_state)
+    lifecycle["env"] = env
     eval_time = env.success_nums + env.fail_nums
     if eval_time >= eval_num:
         # Already complete on resume - nothing left to do.
@@ -367,7 +319,7 @@ def main():
                 raise
             if get_monitor().requires_shell_restart():
                 _exit_for_shell_restart(env, str(e))
-            _restart_or_exit(env, simulation_app, str(e))
+            _restart_or_exit(env, close_application, str(e))
 
         except PhysXBrokenError as e:
             # Monitor caught the warning in time.
@@ -383,11 +335,16 @@ def main():
                 flush=True,
             )
             traceback.print_exc()
+            if env_cfg.tactile.get("enabled", False):
+                # A broken contact world is an infrastructure error, not an
+                # invalid benchmark seed. Do not silently exhaust all layouts.
+                # The outer owner establishes failure status before cleanup.
+                raise
             if enable_monitor and get_monitor().is_fatal():
                 fatal_msg = get_monitor().get_fatal_message() or str(e)
                 if get_monitor().requires_shell_restart():
                     _exit_for_shell_restart(env, fatal_msg)
-                _restart_or_exit(env, simulation_app, fatal_msg)
+                _restart_or_exit(env, close_application, fatal_msg)
             bad = {i for i in get_monitor().get_broken_envs() if i < env.num_envs} if enable_monitor else set()
             if bad:
                 print(
@@ -444,9 +401,31 @@ def main():
         env.close()
 
     _delete_resume_manifest(env)
-    _close_model_client(env)
-    env.close()
-    simulation_app.close()
+
+
+def main():
+    """Retain restart behavior and own final application shutdown once."""
+    lifecycle = {"env": None}
+    close_attempted = False
+
+    def close_application():
+        nonlocal close_attempted
+        if not close_attempted:
+            close_attempted = True
+            simulation_app.close()
+
+    error = None
+    try:
+        _run_evaluation(lifecycle, close_application)
+    except BaseException as caught:
+        error = caught
+    if close_attempted:
+        # A fatal restart already closed the application before execv/exit99.
+        # Do not access its former native stage or replace that exit status.
+        if error is not None:
+            raise error
+        return
+    _finish_evaluation(lifecycle["env"], simulation_app, close_application, error)
 
 
 if __name__ == "__main__":

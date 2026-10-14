@@ -6,6 +6,12 @@ config:
   robot: dual_x5
   camera: camera_config
 
+# Optional native TacEx/UIPC GelSight integration. Keep disabled for the
+# benchmark's stock RGB/state evaluation. Enable only after validating the X5
+# body and prim paths in a local Isaac scene (see docs/tactile.md).
+tactile:
+  enabled: false
+
 observation:
   collect_freq: 25
   robot:

@@ -195,20 +195,32 @@ class CameraView(XFormPrim):
         self._output_annotators = output_annotators
         self._annotators = dict()
         self.camera_resolution = camera_resolution
-        self._tiled_render_product = None
+        self._render_product = None
+        self._render_product_path = None
         self._setup_tiled_sensor()
 
     def __del__(self):
-        XFormPrim.__del__(self)
-        self._clean_up_tiled_sensor()
+        try:
+            self._clean_up_tiled_sensor()
+        finally:
+            XFormPrim.__del__(self)
 
     def _clean_up_tiled_sensor(self):
         """Clean up the sensor by detaching annotators and destroying render products, and removing related prims."""
-        if self._tiled_render_product is not None:
-            # detach annotators from render product
-            self._tiled_annotator.detach([self._tiled_render_product.path])
-            # delete tiled render products
-            self._tiled_render_product.destroy()
+        self._detach_annotators()
+        product = getattr(self, "_render_product", None)
+        if product is not None:
+            product.destroy()
+            self._render_product = None
+            self._render_product_path = None
+
+    def _detach_annotators(self):
+        """Release graph users before any related render product is destroyed."""
+        product = getattr(self, "_render_product", None)
+        if product is not None:
+            for name in list(self._annotators):
+                self._annotators[name].detach([product.path])
+                del self._annotators[name]
 
     def _get_tiled_resolution(self, num_cameras, resolution) -> Tuple[int, int]:
         """Calculate the resolution for the tiled sensor based on the number of cameras and individual camera resolution.
@@ -308,6 +320,19 @@ class CameraView(XFormPrim):
         else:
             tiled_data: wp.array = data
             info = {}
+        # Never launch a kernel against empty/uninitialized render output.
+        # A dispatcher tick does not prove that this particular product has
+        # produced a valid buffer after reset. Fail explicitly instead of
+        # reading an invalid pointer or reusing the previous episode's image.
+        expected_size = self.tiled_resolution[0] * self.tiled_resolution[1] * spec["channels"]
+        shape = getattr(tiled_data, "shape", ())
+        if (not getattr(tiled_data, "ptr", 0) or not shape
+                or int(np.prod(shape)) != expected_size
+                or getattr(tiled_data, "dtype", None) != spec["dtype"]):
+            raise RuntimeError(
+                f"Camera render product {self._render_product_path} has no valid {annotator_type} output: "
+                f"shape={shape}, expected_elements={expected_size}; render a fresh frame before capture"
+            )
         # tiled image
         if tiled:
             shape = (*self.tiled_resolution, spec["channels"])

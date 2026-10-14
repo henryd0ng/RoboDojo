@@ -41,6 +41,13 @@ need_value() {
   fi
 }
 
+validate_num_envs() {
+  if [[ ! "$1" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[robodojo] --num-envs / ROBODOJO_NUM_ENVS must be a positive integer: $1" >&2
+    exit 2
+  fi
+}
+
 policy_eval_uses_expert_num() {
   local eval_script="$1"
   grep -Eq 'expert_data_num|expert_num' "${eval_script}"
@@ -95,6 +102,8 @@ run_eval() {
   local eval_env="RoboDojo"
   local policy_dir=""
   local eval_num="${EVAL_NUM:-}"
+  local num_envs="${ROBODOJO_NUM_ENVS:-}"
+  local headless="1"
   local dry_run="false"
 
   while [[ $# -gt 0 ]]; do
@@ -112,6 +121,9 @@ run_eval() {
       --eval-env) need_value "$@"; eval_env="$2"; shift 2 ;;
       --policy-dir) need_value "$@"; policy_dir="$(abs_path "$2")"; shift 2 ;;
       --eval-num) need_value "$@"; eval_num="$2"; shift 2 ;;
+      --num-envs) need_value "$@"; validate_num_envs "$2"; num_envs="$2"; shift 2 ;;
+      --gui) headless="0"; shift ;;
+      --headless) headless="1"; shift ;;
       --dry-run) dry_run="true"; shift ;;
       -h|--help)
         cat <<'EOF'
@@ -125,6 +137,7 @@ Required:
 
 Common options:
   --eval-num NUM|native  Override EVAL_NUM for this eval; use `native` for per-task counts from _task.yml
+  --num-envs NUM        Number of parallel simulation environments (default: simulator preset)
   --env-cfg NAME        env_cfg stem (default: arx_x5)
   --expert-num NUM      Expert-data count for policy eval.sh files that accept it (default: 100)
   --action-type NAME    Policy action type (default: ee)
@@ -132,6 +145,8 @@ Common options:
   --policy-gpu ID       Policy server GPU (default: 0)
   --env-gpu ID          Isaac Sim GPU (default: 0)
   --eval-env ENV        Simulator conda env (default: RoboDojo)
+  --gui                 Open the simulator window
+  --headless            Run without a window (default)
   --dry-run             Print command without running it
 
 Split / multi-machine: use `robodojo.sh server` + `robodojo.sh client` (see docs/SPLIT_EVAL.md).
@@ -187,12 +202,20 @@ EOF
   if [[ -n "${eval_num}" && "${eval_num}" != "native" ]]; then
     export EVAL_NUM="${eval_num}"
   fi
+  if [[ -n "${num_envs}" ]]; then
+    validate_num_envs "${num_envs}"
+    export ROBODOJO_NUM_ENVS="${num_envs}"
+  fi
 
   echo "[robodojo eval] policy_dir=${policy_dir}"
-  echo "[robodojo eval] task=${task} env_cfg=${env_cfg} eval_num=${EVAL_NUM:-default}"
+  echo "[robodojo eval] task=${task} env_cfg=${env_cfg} eval_num=${EVAL_NUM:-default} headless=${headless}"
 
   if [[ "${dry_run}" == "true" ]]; then
-    printf '[robodojo eval] dry-run: bash %q' "${ROOT_DIR}/scripts/internal/run_policy_eval.sh"
+    printf '[robodojo eval] dry-run: env ROBODOJO_HEADLESS=%q' "${headless}"
+    if [[ -n "${num_envs}" ]]; then
+      printf ' ROBODOJO_NUM_ENVS=%q' "${num_envs}"
+    fi
+    printf ' bash %q' "${ROOT_DIR}/scripts/internal/run_policy_eval.sh"
     printf ' %q' "${policy_dir}"
     printf ' %q' "${eval_args[@]}"
     printf '\n'
@@ -202,7 +225,7 @@ EOF
   local start_sec end_sec elapsed_sec
   start_sec="$(date +%s)"
   (
-    bash "${ROOT_DIR}/scripts/internal/run_policy_eval.sh" "${policy_dir}" "${eval_args[@]}"
+    ROBODOJO_HEADLESS="${headless}" bash "${ROOT_DIR}/scripts/internal/run_policy_eval.sh" "${policy_dir}" "${eval_args[@]}"
   )
   end_sec="$(date +%s)"
   elapsed_sec=$((end_sec - start_sec))
@@ -340,11 +363,13 @@ run_client() {
   local ckpt="external"
   local action_type="ee"
   local eval_num="${EVAL_NUM:-}"
+  local num_envs="${ROBODOJO_NUM_ENVS:-}"
   local connect_timeout="5"
   local only_tasks=""
   local tasks_file=""
   local dimensions=""
   local limit=""
+  local headless="1"
   local dry_run="false"
 
   while [[ $# -gt 0 ]]; do
@@ -363,6 +388,7 @@ run_client() {
       --ckpt) need_value "$@"; ckpt="$2"; shift 2 ;;
       --action-type) need_value "$@"; action_type="$2"; shift 2 ;;
       --eval-num) need_value "$@"; eval_num="$2"; shift 2 ;;
+      --num-envs) need_value "$@"; validate_num_envs "$2"; num_envs="$2"; shift 2 ;;
       --connect-timeout) need_value "$@"; connect_timeout="$2"; shift 2 ;;
       --only) need_value "$@"; only_tasks="$2"; shift 2 ;;
       --tasks-file) need_value "$@"; tasks_file="$2"; shift 2 ;;
@@ -373,6 +399,8 @@ run_client() {
         ;;
       --all) shift ;;
       --limit) need_value "$@"; limit="$2"; shift 2 ;;
+      --gui) headless="0"; shift ;;
+      --headless) headless="1"; shift ;;
       --dry-run) dry_run="true"; shift ;;
       -h|--help)
         cat <<'EOF'
@@ -399,9 +427,12 @@ Required:
 
 Common options:
   --eval-num NUM|native  Override EVAL_NUM for this run; `native` uses per-task counts
+  --num-envs NUM         Number of parallel simulation environments (default: simulator preset)
   --env-cfg NAME         env_cfg stem (default: arx_x5)
   --seed NUM             Eval seed / layout seed (default: 0)
   --env-gpu ID           Isaac Sim GPU (default: 0)
+  --gui                  Open the simulator window (single task only)
+  --headless             Run without a window (default)
   --gpu-ids IDS          Batch mode only: comma-separated client GPU ids
   --env-gpu-ids IDS      Batch mode only: comma-separated client GPU ids
   --ckpt NAME            Checkpoint label recorded in result paths (default: external)
@@ -442,11 +473,19 @@ EOF
   fi
 
   local batch_mode="false"
+  if [[ -n "${num_envs}" ]]; then
+    validate_num_envs "${num_envs}"
+    export ROBODOJO_NUM_ENVS="${num_envs}"
+  fi
   if [[ -z "${task}" ]]; then
     batch_mode="true"
   fi
 
   if [[ "${batch_mode}" == "true" ]]; then
+    if [[ "${headless}" == "0" ]]; then
+      echo "[robodojo client] --gui requires a single task selected with --task" >&2
+      exit 2
+    fi
     if [[ -z "${policy_host}" || -z "${policy_port}" ]]; then
       echo "[robodojo client] batch mode requires --policy-host and --policy-port" >&2
       exit 2
@@ -491,7 +530,7 @@ EOF
     if [[ "${dry_run}" == "true" ]]; then
       batch_args+=(--dry-run)
     fi
-    bash "${ROOT_DIR}/scripts/internal/smoke_all_tasks.sh" "${batch_args[@]}"
+    ROBODOJO_HEADLESS="${headless}" bash "${ROOT_DIR}/scripts/internal/smoke_all_tasks.sh" "${batch_args[@]}"
     return $?
   fi
 
@@ -523,8 +562,16 @@ EOF
     --additional_info "${additional_info}"
     --seed "${seed}"
   )
+  if [[ -n "${num_envs}" ]]; then
+    client_args+=(--num_envs "${num_envs}")
+  fi
+  if [[ "${headless}" == "0" ]]; then
+    client_args+=(--gui)
+  else
+    client_args+=(--headless)
+  fi
 
-  echo "[robodojo client] task=${task} policy=${policy_name} server=${policy_host}:${policy_port} eval_num=${EVAL_NUM:-default}"
+  echo "[robodojo client] task=${task} policy=${policy_name} server=${policy_host}:${policy_port} eval_num=${EVAL_NUM:-default} headless=${headless}"
 
   if [[ "${dry_run}" == "true" ]]; then
     printf '[robodojo client] dry-run: bash %q' "${ROOT_DIR}/scripts/eval_policy.sh"

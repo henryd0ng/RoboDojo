@@ -1,0 +1,384 @@
+--- a/source/tacex/setup.py
++++ b/source/tacex/setup.py
+@@ -20,9 +20,9 @@
+     #     "torch_scatter @"
+     #     " https://data.pyg.org/whl/torch-2.5.0%2Bcu118/torch_scatter-2.1.2%2Bpt25cu118-cp310-cp310-linux_x86_64.whl"
+     # ),
+-    (  # Isaac Sim 5.1 ships Python 3.11, PyTorch 2.7 and CUDA 12.6
++    (  # Isaac Sim 5.1 ships Python 3.11, PyTorch 2.7 and CUDA 12.8
+         "torch_scatter @"
+-        "https://data.pyg.org/whl/torch-2.7.0%2Bcu126/torch_scatter-2.1.2%2Bpt27cu126-cp311-cp311-linux_x86_64.whl"
++        "https://data.pyg.org/whl/torch-2.7.0%2Bcu128/torch_scatter-2.1.2%2Bpt27cu128-cp311-cp311-linux_x86_64.whl"
+     ),
+     "psutil",
+     "nvidia-ml-py",
+--- a/source/tacex/tacex/gelsight_sensor.py
++++ b/source/tacex/tacex/gelsight_sensor.py
+@@ -667,6 +667,13 @@
+         return self._data.output["camera_depth"]
+ 
+     def _get_height_map(self):
++        nominal = getattr(self, "_robodojo_nominal_depth", None)
++        if nominal is not None:
++            depth = self.camera.data.output["depth"][..., 0]
++            valid = self._robodojo_nominal_mask & torch.isfinite(depth)
++            delta = torch.where(valid, depth-nominal, torch.zeros_like(depth))
++            self._data.output["height_map"].copy_(delta.clamp(-self.cfg.gelpad_dimensions.height, 0.) * 1000.)
++            return self._data.output["height_map"]
+         if self.camera is not None:
+             self._data.output["height_map"][:] = self.camera.data.output["depth"][
+                 :, :, :, 0
+--- a/source/tacex_uipc/tacex_uipc/objects/uipc_object.py
++++ b/source/tacex_uipc/tacex_uipc/objects/uipc_object.py
+@@ -229,6 +229,12 @@
+         self, gprim: UsdGeom.Mesh, surf_points: np.array, surf_tri: np.array, surf_tri_orient: np.array
+     ) -> usdrt.Usd.Prim:
+         usd_mesh_path = str(gprim.GetPath())
++        # Solver surface vertices are world coordinates. Author this contract
++        # in USD as well as Fabric: a later hierarchy update must not compose
++        # the original asset transform a second time.
++        world_mesh = UsdGeom.Xformable(gprim)
++        world_mesh.ClearXformOpOrder()
++        world_mesh.SetResetXformStack(True)
+ 
+         # update the isaac surface mesh with the new topology
+         MeshGenerator.update_usd_mesh(gprim=gprim, surf_points=surf_points, triangles=surf_tri)
+--- a/source/tacex_uipc/libuipc/scripts/after_build_pyuipc.py
++++ b/source/tacex_uipc/libuipc/scripts/after_build_pyuipc.py
+@@ -41,7 +41,9 @@
+     paths = [
+         'src/',
+         'pyproject.toml',
+-        'setup.py'
++        'setup.py',
++        'LICENSE',
++        'README.md'
+     ]
+     
+     # copy the folders and files to the target directory
+@@ -70,11 +72,20 @@
+ 
+     for file in os.listdir(shared_lib_dir):
+         file = str(file)
+-        if file.endswith(tuple(shared_lib_exts)):
++        if file.endswith(tuple(shared_lib_exts)) or '.so.' in file:
+             print(f'Copying {file}')
+             full_path_file = shared_lib_dir / file
+             shutil.copy(full_path_file, target_dir)
+ 
++    # The editable package must contain its vcpkg runtime dependencies too.
++    # Preserve dependency copyright files alongside the generated package.
++    for library in (binary_dir / 'vcpkg_installed' / 'x64-linux' / 'lib').glob('*.so*'):
++        shutil.copy2(library, target_dir / library.name)
++    notices = binary_dir / 'python' / 'THIRD_PARTY_NOTICES'
++    for notice in (binary_dir / 'vcpkg_installed' / 'x64-linux' / 'share').glob('*/copyright'):
++        destination = notices / notice.parent.name
++        destination.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(notice, destination / 'copyright')
+     return target_dir
+ 
+ def generate_stub(target_dir):
+@@ -166,6 +177,6 @@
+     generate_stub(target_dir)
+     flush_info()
+     
+-    print(f'Installing the package to Python Environment: {sys.executable}')
+-    install_package(binary_dir)
++    # RoboDojo installs explicitly after the complete build succeeds.
++    print(f'Python package ready for installation: {binary_dir / "python"}')
+     flush_info()
+--- a/source/tacex_uipc/libuipc/cmake/uipc_utils.cmake
++++ b/source/tacex_uipc/libuipc/cmake/uipc_utils.cmake
+@@ -187,7 +187,7 @@
+     if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${target}")
+         uipc_error("Can not find submodule ${target} in ${CMAKE_CURRENT_SOURCE_DIR}, why?")
+     endif()
+-    if (NOT UIPC_DEV_MODE)
++    if (NOT UIPC_DEV_MODE AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${target}/CMakeLists.txt")
+         # NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${target}/.git"
+         find_package(Git QUIET)
+         execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init ${target}
+--- a/source/tacex_uipc/setup.py
++++ b/source/tacex_uipc/setup.py
+@@ -127,7 +127,8 @@
+         "Programming Language :: Python :: 3.10",
+         "Isaac Sim :: 5.1.0",
+     ],
+-    ext_modules=[CMakeExtension("uipc", "libuipc")],
+-    cmdclass=dict(build_ext=CMakeBuild),
++    # The RoboDojo installer builds libuipc explicitly before installing this wrapper.
++    ext_modules=[] if os.environ.get("ROBODOJO_TACEX_SKIP_BUILD") == "1" else [CMakeExtension("uipc", "libuipc")],
++    cmdclass={} if os.environ.get("ROBODOJO_TACEX_SKIP_BUILD") == "1" else dict(build_ext=CMakeBuild),
+     zip_safe=False,
+ )
+--- a/source/tacex_uipc/libuipc/src/backends/cuda/engine/sim_engine_do_advance.cu
++++ b/source/tacex_uipc/libuipc/src/backends/cuda/engine/sim_engine_do_advance.cu
+@@ -19,6 +19,7 @@
+     Float alpha     = 1.0;
+     Float ccd_alpha = 1.0;
+     Float cfl_alpha = 1.0;
++    const char* strict_failure = nullptr;
+ 
+     /***************************************************************************************
+     *                                  Function Shortcuts
+@@ -186,7 +187,7 @@
+         }
+     };
+ 
+-    auto check_line_search_iter = [this](SizeT iter)
++    auto check_line_search_iter = [this, &strict_failure](SizeT iter) -> bool
+     {
+         if(iter >= m_line_searcher->max_iter())
+         {
+@@ -196,12 +197,14 @@
+ 
+             if(m_strict_mode->view()[0])
+             {
+-                throw SimEngineException("StrictMode: Line Search Exits with Max Iteration");
+-            }
+-        }
+-    };
+-
+-    auto check_newton_iter = [this](SizeT iter)
++                strict_failure = "StrictMode: Line Search Exits with Max Iteration";
++                return false;
++            }
++        }
++        return true;
++    };
++
++    auto check_newton_iter = [this, &strict_failure](SizeT iter) -> bool
+     {
+         if(iter >= m_newton_max_iter->view()[0])
+         {
+@@ -211,7 +214,8 @@
+ 
+             if(m_strict_mode->view()[0])
+             {
+-                throw SimEngineException("StrictMode: Newton Iteration Exits with Max Iteration");
++                strict_failure = "StrictMode: Newton Iteration Exits with Max Iteration";
++                return false;
+             }
+         }
+         else
+@@ -221,6 +225,7 @@
+                          m_newton_min_iter->view()[0],
+                          m_newton_max_iter->view()[0]);
+         }
++        return true;
+     };
+ 
+     /***************************************************************************************
+@@ -374,8 +379,11 @@
+                         }
+ 
+                         // Check Line Search Iteration
+-                        // report warnings or throw exceptions if needed
+-                        check_line_search_iter(line_search_iter);
++                        // Report warnings or stop on a strict-mode failure.
++                        // The exhausted loop already computed a final trial.
++                        // Retain the energy acceptance predicate, including NaN rejection.
++                        if(!(E <= E0) && !check_line_search_iter(line_search_iter))
++                            return;
+                     }
+                 }
+             }
+@@ -388,8 +396,9 @@
+             }
+ 
+             // Check Newton Iteration
+-            // report warnings or throw exceptions if needed
+-            check_newton_iter(newton_iter);
++            // Report warnings or stop on a strict-mode failure.
++            if(!check_newton_iter(newton_iter))
++                return;
+         }
+ 
+         logger::info("<<< End Frame: {}", m_current_frame);
+@@ -398,6 +407,9 @@
+     try
+     {
+         pipeline();
++        // Expected solver failures must leave the noexcept pipeline before throwing.
++        if(strict_failure)
++            throw SimEngineException(strict_failure);
+     }
+     catch(const SimEngineException& e)
+     {
+--- a/source/tacex_uipc/tacex_uipc/sim/uipc_sim.py
++++ b/source/tacex_uipc/tacex_uipc/sim/uipc_sim.py
+@@ -40,6 +40,8 @@
+     debug_vis: bool = False
+ 
+     dt: float = 0.01
++
++    strict_mode: bool = False
+ 
+     sanity_check_enable: bool = True
+     sanity_check_mode: str = "quiet"
+@@ -193,6 +195,8 @@
+             "transrate_tol": self.cfg.newton.transrate_tol,
+         }
+ 
++        uipc_config["extras"]["strict_mode"]["enable"] = int(self.cfg.strict_mode)
++
+         self.scene = Scene(uipc_config)
+ 
+         # create ground
+--- a/source/tacex_uipc/tacex_uipc/objects/constraints/uipc_isaac_attachments.py
++++ b/source/tacex_uipc/tacex_uipc/objects/constraints/uipc_isaac_attachments.py
+@@ -37,6 +37,19 @@
+     from ..uipc_object import UipcObject
+ 
+ 
++def _target_dtype(value):
++    if type(value) is not str or value not in {"float32", "float64"}:
++        raise ValueError("Attachment target_dtype must be 'float32' or 'float64'")
++    return torch.float64 if value == "float64" else torch.float32
++
++
++def _unit_quaternion(quaternion):
++    norm = torch.linalg.vector_norm(quaternion, dim=-1, keepdim=True)
++    if not torch.isfinite(quaternion).all() or not torch.isfinite(norm).all() or (norm <= 1e-12).any():
++        raise ValueError("Float64 attachment quaternion must be finite and nonzero")
++    return quaternion / norm
++
++
+ @configclass
+ class UipcIsaacAttachmentsCfg(UipcConstraintCfg):
+     debug_vis: bool = False
+@@ -74,13 +87,26 @@
+     """
+ 
+ 
++    target_dtype: str = "float32"
++    """Arithmetic dtype for initial local offsets and later world targets.
++
++    Float64 preserves measured PhysX pose values; it does not add pose precision.
++    It requires offsets computed from the original undeformed world mesh.
++    """
++
+ class UipcIsaacAttachments(UipcConstraint):
+     cfg: UipcIsaacAttachmentsCfg
+ 
+     # todo code init properly
+     def __init__(self, cfg: UipcIsaacAttachmentsCfg, uipc_object: UipcObject) -> None:
+         # check that the config is valid
++        self._initialize_handle = None
++        self._invalidate_initialize_handle = None
++        self._debug_vis_handle = None
+         cfg.validate()
++        _target_dtype(cfg.target_dtype)
++        if cfg.target_dtype == "float64" and not cfg.compute_attachment_data:
++            raise ValueError("Float64 targets require recomputing original attachment offsets")
+         self.cfg: UipcIsaacAttachmentsCfg = cfg.copy()
+ 
+         self.uipc_object: UipcObject = uipc_object
+@@ -135,6 +161,8 @@
+                 tet_indices,
+                 attachment_points_radius,
+                 attachment_indices=self.cfg.attachment_point_indices,
++                target_dtype=self.cfg.target_dtype,
++                device="cuda:0" if self.cfg.target_dtype == "float32" else "cpu",
+             )
+ 
+         # set attachment data
+@@ -271,11 +299,15 @@
+         sphere_radius=5e-4,
+         max_dist=1e-5,
+         attachment_indices: list[int] | None = None,
++        *,
++        target_dtype: str = "float32",
++        device: str = "cuda:0",
+     ):  # really small distances to prevent intersection with unwanted geometries
+         """
+ 
+         Returns: attachment_offsets, attachment_indices and the found rigid prims to the isaac_mesh_path
+         """
++        dtype = _target_dtype(target_dtype)
+         print(f"Creating Uipc x Isaac attachments for {isaac_mesh_path}")
+         # Sweep-based discovery needs cooked PhysX collision data. Explicit
+         # calibrated indices do not, and are reliable before the timeline plays.
+@@ -303,7 +335,9 @@
+ 
+         q = pose.ExtractRotation().GetQuaternion()
+         obj_orientation = [q.GetReal(), q.GetImaginary()[0], q.GetImaginary()[1], q.GetImaginary()[2]]
+-        obj_orientation = torch.tensor(np.array([obj_orientation]), device="cuda:0").float()
++        obj_orientation = torch.tensor(np.array([obj_orientation]), device=device).to(dtype=dtype)
++        if target_dtype == "float64":
++            obj_orientation = _unit_quaternion(obj_orientation)
+ 
+         idx = []
+         attachment_points_positions = []
+@@ -353,7 +387,7 @@
+                 # TODO do this at the end and compute in a vectorized fashion?
+                 # compute offsets from object position to attachment points
+                 offset = v - obj_pos
+-                offset = torch.tensor(offset, device="cuda:0").float()
++                offset = torch.tensor(offset, device=device).to(dtype=dtype)
+                 offset = math_utils.quat_apply_inverse(obj_orientation[0].reshape((1, 4)), offset.reshape((1, 3)))[
+                     0
+                 ]
+@@ -455,7 +489,7 @@
+ 
+         animator.insert(self.uipc_object.uipc_scene_objects[0], animate_tet)
+ 
+-    def _compute_aim_positions(self, dt=0):
++    def _read_body_pose(self):
+         # make sure we have the newest data
+         if type(self.isaaclab_rigid_object) is Articulation:
+             # this only works when rigid body is an articulation
+@@ -476,28 +510,38 @@
+         # - doing this is undesirable -> need to update the scene to get newest data and that happens in the next sim step
+         # pose = self.isaaclab_rigid_object.data.body_state_w[:, self.rigid_body_id, 0:7].clone()
+ 
+-        self.obj_pose = pose
+-
+-        # obj_pos = pose[:, 0, :3].cpu().numpy().flatten().reshape(-1,3)
+-        # self._draw.clear_points()
+-        # draw.draw_points(obj_pos, [(0,255,0,0.5)]*obj_pos.shape[0], [50]*obj_pos.shape[0]) # the new positions
+-
++        return pose
++
++    def _aim_positions_from_pose(self, pose):
+         attachment_offsets = torch.tensor(
+             self.attachment_offsets.reshape((self._num_instances, self.num_attachment_points_per_obj, 3)),
+             device=self.device,
+-        ).float()
++        )
++        if self.cfg.target_dtype == "float64":
++            attachment_offsets = attachment_offsets.to(dtype=torch.float64)
++            pose = pose.to(dtype=torch.float64)
++            if not torch.isfinite(pose).all():
++                raise ValueError("Float64 attachment pose must be finite")
++            position = pose[:, 0, 0:3]
++            quaternion = _unit_quaternion(pose[:, 0, 3:])
++        else:
++            attachment_offsets = attachment_offsets.float()
++            position, quaternion = pose[:, 0, 0:3], pose[:, 0, 3:]
+         # only access pose of a single body (that's why idx=0 in second dim)
+         aim_pos = transform_points(
+-            attachment_offsets, pos=pose[:, 0, 0:3], quat=pose[:, 0, 3:]
++            attachment_offsets, pos=position, quat=quaternion
+         )  # todo give over batch of pos and quat for each instance (i.e. pos has shape N,3 and quat N,4)
+         aim_pos = aim_pos.cpu().numpy()
+-        self._aim_positions = aim_pos.flatten().reshape(-1, 3)
+-
+-        #      # extract velocity
+-        #      lin_vel = scene["robot"].data.body_state_w[:, robot_entity_cfg.body_ids[1], 7:10]
+-        #      lin_vel = lin_vel.cpu().numpy()
+-        #      lin_vel = np.tile(lin_vel, len(attachment_points)).reshape(len(attachment_points),3)
+-
++        return aim_pos.flatten().reshape(-1, 3)
++
++    def measure_aim_positions(self):
++        """Read fresh poses and targets without reading or changing callback caches."""
++        pose = self._read_body_pose()
++        return pose, self._aim_positions_from_pose(pose)
++
++    def _compute_aim_positions(self, dt=0):
++        self.obj_pose = self._read_body_pose()
++        self._aim_positions = self._aim_positions_from_pose(self.obj_pose)
+         return self._aim_positions
+ 
+     """

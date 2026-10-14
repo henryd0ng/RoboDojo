@@ -30,6 +30,7 @@ class RigidObject(SingleRigidPrim, SingleGeometryPrim):
         default_ori: tuple,
         scale: tuple,
     ):
+        self._dynamics_backend = None
         if usd_path:
             prim = add_reference_to_stage(usd_path=usd_path, prim_path=prim_path)
         else:
@@ -98,6 +99,26 @@ class RigidObject(SingleRigidPrim, SingleGeometryPrim):
         self._default_angular_velocity = [0.0, 0.0, 0.0]
 
         self._setup_physics()
+
+    def set_dynamics_backend(self, backend):
+        """Delegate pose/reset operations to an optional external solver."""
+        self._dynamics_backend = backend
+
+    def get_local_pose(self):
+        if self._dynamics_backend is not None:
+            return self._dynamics_backend.get_local_pose()
+        return super().get_local_pose()
+
+    def get_world_pose(self):
+        if self._dynamics_backend is not None:
+            return self._dynamics_backend.get_world_pose()
+        return super().get_world_pose()
+
+    def set_local_pose(self, translation=None, orientation=None):
+        if self._dynamics_backend is not None:
+            self._dynamics_backend.set_local_pose(translation, orientation)
+            return
+        super().set_local_pose(translation=translation, orientation=orientation)
 
     def _get_object_transform(self, device=None):
         """
@@ -217,6 +238,9 @@ class RigidObject(SingleRigidPrim, SingleGeometryPrim):
 
     def apply_saved_pose(self):
         """Apply the saved eval-layout pose and clear velocities."""
+        if self._dynamics_backend is not None:
+            self._dynamics_backend.set_local_pose(self.default_pos, self.default_ori)
+            return
         self.set_local_pose(translation=self.default_pos, orientation=self.default_ori)
         self.set_local_scale(np.array(self.scale))
         self._apply_default_velocities()
@@ -230,22 +254,32 @@ class RigidObject(SingleRigidPrim, SingleGeometryPrim):
             _FAR_CENTER[1] + random.uniform(-_FAR_JITTER, _FAR_JITTER),
             _FAR_CENTER[2] + random.uniform(-_FAR_JITTER, _FAR_JITTER),
         )
+        if self._dynamics_backend is not None:
+            self._dynamics_backend.set_local_pose(far_pos, self.default_ori)
+            return
         self.set_local_pose(translation=far_pos, orientation=self.default_ori)
         self.set_local_scale(np.array(self.scale))
         self._apply_default_velocities()
 
     def initialize(self):
+        if self._dynamics_backend is not None:
+            return
         self.physics_sim_view = SimulationManager.get_physics_sim_view()
         super().initialize(physics_sim_view=self.physics_sim_view)
 
     def _apply_default_velocities(self):
         """Re-apply default linear/angular velocity if configured."""
+        if self._dynamics_backend is not None:
+            self._dynamics_backend.clear_velocity()
+            return
         if self._default_linear_velocity is not None:
             self.set_linear_velocity(torch.tensor(self._default_linear_velocity))
         if self._default_angular_velocity is not None:
             self.set_angular_velocity(torch.tensor(self._default_angular_velocity))
 
     def destroy(self):
+        if self._dynamics_backend is not None:
+            self._dynamics_backend.close()
         self._rigid_prim_view.disable_gravities()
         self._geometry_prim_view.disable_collision()
         self._rigid_prim_view.set_visibilities([False])

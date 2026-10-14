@@ -1,0 +1,19 @@
+# Linux x86_64 / Python 3.11 / torch 2.7 cu128 optional dependencies.
+# Isaac/PyTorch/NumPy come from the existing environment. TacEx and pyuipc
+# are built from pinned sources by install_tactile.sh, not fetched from PyPI.
+torch-scatter @ https://data.pyg.org/whl/torch-2.7.0%2Bcu128/torch_scatter-2.1.2%2Bpt27cu128-cp311-cp311-linux_x86_64.whl#sha256=988f0a856d7f45ea6b0ee6c7ccd95d359001c50cb50bd50a03ab21d3f48f6383
+wildmeshing==0.4.1
+tetgen==0.8.4
+polyscope==2.6.1
+opencv-python-headless==4.11.0.86
+toml==0.10.2
+pybind11==3.1.0
+mypy==2.3.1
+setuptools==75.8.2
+wheel==0.42.0
+debugpy==1.8.22
+psutil==5.9.8
+nvidia-ml-py==13.610.43
+transforms3d==0.4.2
+msgpack==1.2.2
+msgpack-numpy==0.4.8

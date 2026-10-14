@@ -1,0 +1,349 @@
+diff --git a/source/tacex/tacex/simulation_approaches/gpu_taxim/sim/taxim_torch.py b/source/tacex/tacex/simulation_approaches/gpu_taxim/sim/taxim_torch.py
+--- a/source/tacex/tacex/simulation_approaches/gpu_taxim/sim/taxim_torch.py
++++ b/source/tacex/tacex/simulation_approaches/gpu_taxim/sim/taxim_torch.py
+@@ -78,6 +78,12 @@
+                 .float()
+                 .to(device)
+             )
++            # Zero tilt has no azimuth. Use a single endpoint-aware estimate
++            # at the polar origin for the optical-only interpolation path.
++            self.__flat_normal_poly = (
++                self.__poly_grad[:, 0, :-1].sum(dim=1)
++                + (self.__poly_grad[:, 0, -1] - self.__poly_grad[:, 0, 0]) * 0.5
++            ) / (self.sensor_params.num_bins - 1)
+ 
+             gel_map = self.__np_img_to_torch(np.load(str(calib_folder / "gelmap.npy")), has_channels=False)
+             gel_map = (
+@@ -213,6 +219,116 @@
+     ) -> torch.Tensor:
+         return self.render(height_map, with_shadow, press_depth, orig_hm_fmt)
+ 
++    @torch.jit.export
++    def render_surface(
++        self,
++        surface_height_mm: torch.Tensor,
++        with_shadow: bool = False,
++        valid_mask: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Render an already-deformed gel surface without changing its shape.
++
++        Heights are signed millimetres in the calibrated image coordinates:
++        zero is the flat reference, negative values approach the camera, and
++        positive values recede from it. This is an optical-only interface for
++        external mechanics solvers, not an object-to-gel deformation model.
++        It does not recover an unknown curved reference surface or calibrate
++        a camera's spatial scale. Shadows require a measured contact mask and
++        are intentionally unsupported by this interface. An optional boolean
++        validity mask must match the input. A pixel receives a surface normal
++        only when its center and four central-difference neighbors are valid;
++        other pixels receive the calibrated flat response.
++        """
++        if with_shadow:
++            raise ValueError("render_surface does not support shadows without a physical contact mask")
++        if surface_height_mm.dim() < 2:
++            raise ValueError("surface_height_mm must have at least two dimensions")
++        if surface_height_mm.shape[-2] < 3 or surface_height_mm.shape[-1] < 3 or surface_height_mm.numel() == 0:
++            raise ValueError("surface_height_mm requires a nonempty batch and spatial dimensions of at least 3 x 3")
++        if not surface_height_mm.is_floating_point() or not torch.isfinite(surface_height_mm).all():
++            raise ValueError("surface_height_mm must be a finite floating-point tensor")
++        with torch.no_grad():
++            batch_shape = surface_height_mm.shape[:-2]
++            surface = surface_height_mm.to(dtype=self.__poly_grad.dtype).reshape(
++                (-1,) + surface_height_mm.shape[-2:]
++            )
++            stencil_valid = None
++            if valid_mask is not None:
++                if valid_mask.dtype != torch.bool or valid_mask.shape != surface_height_mm.shape:
++                    raise ValueError("valid_mask must be boolean and match surface_height_mm.shape")
++                valid = valid_mask.to(device=surface.device).reshape(surface.shape)
++                interior = valid[:, 1:-1, 1:-1] & valid[:, :-2, 1:-1] & valid[:, 2:, 1:-1]
++                interior = interior & valid[:, 1:-1, :-2] & valid[:, 1:-1, 2:]
++                stencil_valid = torch.nn.functional.pad(interior, (1, 1, 1, 1), value=False)
++            image = self.__render_optics(
++                surface, surface < 0, shadow=False, interpolate_angles=True, stencil_valid=stencil_valid
++            )
++            return image.reshape(batch_shape + image.shape[-3:])
++
++    @torch.jit.export
++    def render_surface_difference(
++        self,
++        surface_height_mm: torch.Tensor,
++        reference_surface_height_mm: torch.Tensor,
++        valid_mask: torch.Tensor | None = None,
++        reference_valid_mask: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Render changes in absolute surface normals against a captured reference.
++
++        Both height fields use the same calibrated coordinates and millimetres.
++        A curved reference is evaluated with its own normals; differentiating
++        only its height difference would incorrectly treat it as a flat gel.
++        The common valid stencil excludes missing skin and its neighbors.
++        Optical responses remain unclipped until their difference is added to
++        the calibrated flat image. This preserves changes at saturated slopes.
++        No additional deformation, smoothing, or contact shape is introduced.
++        """
++        if surface_height_mm.shape != reference_surface_height_mm.shape:
++            raise ValueError("Current and reference surface heights must have matching shapes")
++        if surface_height_mm.dim() < 2:
++            raise ValueError("Surface heights must have at least two dimensions")
++        if surface_height_mm.shape[-2] < 3 or surface_height_mm.shape[-1] < 3 or surface_height_mm.numel() == 0:
++            raise ValueError("Surface heights require a nonempty batch and spatial dimensions of at least 3 x 3")
++        if (
++            not surface_height_mm.is_floating_point()
++            or not reference_surface_height_mm.is_floating_point()
++            or not torch.isfinite(surface_height_mm).all()
++            or not torch.isfinite(reference_surface_height_mm).all()
++        ):
++            raise ValueError("Surface heights must be finite floating-point tensors")
++        with torch.no_grad():
++            batch_shape = surface_height_mm.shape[:-2]
++            surface = surface_height_mm.to(device=self.__poly_grad.device, dtype=self.__poly_grad.dtype).reshape(
++                (-1,) + surface_height_mm.shape[-2:]
++            )
++            reference = reference_surface_height_mm.to(device=surface.device, dtype=surface.dtype).reshape(surface.shape)
++            stencil_valid = None
++            if valid_mask is not None or reference_valid_mask is not None:
++                valid = torch.ones_like(surface, dtype=torch.bool)
++                if valid_mask is not None:
++                    if valid_mask.dtype != torch.bool or valid_mask.shape != surface_height_mm.shape:
++                        raise ValueError("Current validity mask must be boolean and match the surface heights")
++                    valid = valid & valid_mask.to(device=surface.device).reshape(surface.shape)
++                if reference_valid_mask is not None:
++                    if reference_valid_mask.dtype != torch.bool or reference_valid_mask.shape != surface_height_mm.shape:
++                        raise ValueError("Reference validity mask must be boolean and match the surface heights")
++                    valid = valid & reference_valid_mask.to(device=surface.device).reshape(surface.shape)
++                interior = valid[:, 1:-1, 1:-1] & valid[:, :-2, 1:-1] & valid[:, 2:, 1:-1]
++                interior = interior & valid[:, 1:-1, :-2] & valid[:, 1:-1, 2:]
++                stencil_valid = torch.nn.functional.pad(interior, (1, 1, 1, 1), value=False)
++            flat = torch.zeros_like(surface)
++            current_response = self.__render_optics(
++                surface, surface < 0, interpolate_angles=True, stencil_valid=stencil_valid, clip_output=False
++            )
++            reference_response = self.__render_optics(
++                reference, reference < 0, interpolate_angles=True, stencil_valid=stencil_valid, clip_output=False
++            )
++            flat_response = self.__render_optics(
++                flat, flat < 0, interpolate_angles=True, stencil_valid=stencil_valid, clip_output=False
++            )
++            image = torch.clip(flat_response + (current_response - reference_response), 0, 1)
++            return image.reshape(batch_shape + image.shape[-3:])
++
+     def __bgr_to_rgb(self, img: torch.Tensor) -> torch.Tensor:
+         """
+         Transforms an image from BGR to RGB.
+@@ -222,6 +338,31 @@
+         """
+         return torch.flip(img, dims=(-3,))
+ 
++    def __sample_periodic_poly(self, magnitude: torch.Tensor, direction: torch.Tensor) -> torch.Tensor:
++        parameters = self.__poly_grad[:, magnitude, direction]
++        # The calibration includes both -pi and +pi. They describe the same
++        # orientation but independent fitted coefficients can differ. Average
++        # these endpoint estimates so the new lookup is continuous at the seam.
++        seam = (self.__poly_grad[:, magnitude, 0] + self.__poly_grad[:, magnitude, -1]) * 0.5
++        parameters = torch.where((direction == 0)[None, ..., None], seam, parameters)
++        parameters = torch.where((magnitude == 0)[None, ..., None],
++                                 self.__flat_normal_poly[:, None, None, None, :], parameters)
++        return parameters.transpose(0, 1)
++
++    def __interpolate_poly_parameters(self, magnitude: torch.Tensor, direction: torch.Tensor) -> torch.Tensor:
++        intervals = self.sensor_params.num_bins - 1
++        magnitude = magnitude.clamp(0, intervals)
++        direction = torch.remainder(direction, intervals)
++        m0 = torch.floor(magnitude).long()
++        m1 = (m0 + 1).clamp(max=intervals)
++        d0 = torch.floor(direction).long()
++        d1 = torch.remainder(d0 + 1, intervals)
++        wm = (magnitude - m0).unsqueeze(1).unsqueeze(-1)
++        wd = (direction - d0).unsqueeze(1).unsqueeze(-1)
++        low = torch.lerp(self.__sample_periodic_poly(m0, d0), self.__sample_periodic_poly(m0, d1), wd)
++        high = torch.lerp(self.__sample_periodic_poly(m1, d0), self.__sample_periodic_poly(m1, d1), wd)
++        return torch.lerp(low, high, wm)
++
+     def __render(self, height_map: torch.Tensor, shadow: bool = False) -> torch.Tensor:
+         """
+         Simulates the tactile image from the height map.
+@@ -234,20 +375,39 @@
+ 
+         deformed_gel, contact_mask = self.__compute_gel_pad_deformation(height_map)
+ 
++        return self.__render_optics(deformed_gel, contact_mask, shadow=shadow)
++
++    def __render_optics(
++        self,
++        deformed_gel: torch.Tensor,
++        contact_mask: torch.Tensor,
++        shadow: bool = False,
++        interpolate_angles: bool = False,
++        stencil_valid: torch.Tensor | None = None,
++        clip_output: bool = True,
++    ) -> torch.Tensor:
++        shape = deformed_gel.shape[1:]
++        height, width = shape
++
+         # generate gradients of the height map
+         deformed_gel_px = deformed_gel / self.sensor_params.pixmm
+         grad_mag, grad_dir = self.__generate_normals(-deformed_gel_px)
++        if stencil_valid is not None:
++            grad_mag = torch.where(stencil_valid, grad_mag, torch.zeros_like(grad_mag))
++            grad_dir = torch.where(stencil_valid, grad_dir, torch.zeros_like(grad_dir))
+ 
+         # generate raw simulated image without background
+         # discretize grids
+         x_binr = 0.5 * torch.pi / (self.sensor_params.num_bins - 1)  # x [0,pi/2]
+         y_binr = 2 * torch.pi / (self.sensor_params.num_bins - 1)  # y [-pi, pi]
+ 
+-        idx_mag = torch.floor(grad_mag / x_binr).long()
+-        idx_dir = torch.floor((grad_dir + torch.pi) / y_binr).long()
+-
+-        # look up polynomial table and assign intensity
+-        params = self.__poly_grad[:, idx_mag, idx_dir].transpose(0, 1)
++        if interpolate_angles:
++            params = self.__interpolate_poly_parameters(grad_mag / x_binr, (grad_dir + torch.pi) / y_binr)
++        else:
++            idx_mag = torch.floor(grad_mag / x_binr).long()
++            idx_dir = torch.floor((grad_dir + torch.pi) / y_binr).long()
++            # Preserve the original object's optical lookup exactly.
++            params = self.__poly_grad[:, idx_mag, idx_dir].transpose(0, 1)
+         params_flat = torch.flatten(params, start_dim=-3, end_dim=-2)
+         sim_img_flat = (self.__get_precomputed_features_cached(shape).unsqueeze(0) * params_flat).sum(-1)
+         sim_img_r = torch.unflatten(sim_img_flat, dim=-1, sizes=(height, width))
+@@ -255,7 +415,7 @@
+         if not shadow:
+             # Add background to simulated image
+             sim_img = sim_img_r + self.__get_background_img_cached(shape)
+-            return torch.clip(sim_img, 0, 1)
++            return torch.clip(sim_img, 0, 1) if clip_output else sim_img
+ 
+         # find shadow attachment area
+         kernel_size_float = np.array(self.sim_params.shadow_attachment_kernel_size(shape))
+diff --git a/source/tacex/tacex/simulation_approaches/gpu_taxim/taxim_sim.py b/source/tacex/tacex/simulation_approaches/gpu_taxim/taxim_sim.py
+--- a/source/tacex/tacex/simulation_approaches/gpu_taxim/taxim_sim.py
++++ b/source/tacex/tacex/simulation_approaches/gpu_taxim/taxim_sim.py
+@@ -29,6 +29,10 @@
+         super().__init__(sensor=sensor, cfg=cfg)
+ 
+     def _initialize_impl(self):
++        if self.cfg.input_mode not in ("object", "deformed_surface"):
++            raise ValueError(f"Unsupported Taxim input_mode: {self.cfg.input_mode!r}")
++        if self.cfg.input_mode == "deformed_surface" and self.cfg.with_shadow:
++            raise ValueError("Taxim deformed_surface mode requires with_shadow=False")
+         calib_folder = Path(self.cfg.calib_folder_path)
+ 
+         if self.cfg.device is None:
+@@ -51,7 +55,10 @@
+             device=self._device,
+         )
+ 
+-        self._taxim: Taxim = Taxim(calib_folder=calib_folder, device=self._device, params=self.cfg.taxim_parameters)
++        self._taxim: Taxim = Taxim(
++            calib_folder=calib_folder, device=self._device, params=self.cfg.taxim_parameters,
++            backend="torch" if self.cfg.input_mode == "deformed_surface" else "auto",
++        )
+ 
+         # -- NOTE: Taxim sim uses (channels, height, width) format
+ 
+@@ -80,10 +87,31 @@
+ 
+         # up/downscale height map if camera res different than tactile img res
+         if (height_map.shape[1], height_map.shape[2]) != (self.cfg.tactile_img_res[1], self.cfg.tactile_img_res[0]):
++            if self.cfg.input_mode == "deformed_surface":
++                raise ValueError("Taxim deformed_surface mode requires matching camera and output resolutions")
+             height_map = F.resize(height_map, (self.cfg.tactile_img_res[1], self.cfg.tactile_img_res[0]))
+ 
+         if self._device == "cpu":
+             height_map = height_map.cpu()
++
++        if self.cfg.input_mode == "deformed_surface":
++            valid_mask = getattr(self.sensor, "_robodojo_depth_valid", None)
++            if valid_mask is not None:
++                valid_mask = valid_mask.to(device=height_map.device)
++            surface = getattr(self.sensor, "_robodojo_surface_height_mm", None)
++            reference = getattr(self.sensor, "_robodojo_reference_surface_height_mm", None)
++            if getattr(self.sensor, "_robodojo_nominal_depth", None) is None or surface is None or reference is None:
++                # Before RoboDojo's nominal capture, reset still uses the
++                # existing signed-surface interface with its zero height map.
++                tactile_rgb = self._taxim.render_surface(height_map, valid_mask=valid_mask)
++            else:
++                tactile_rgb = self._taxim.render_surface_difference(
++                    surface.to(device=height_map.device), reference.to(device=height_map.device),
++                    valid_mask=self.sensor._robodojo_surface_valid.to(device=height_map.device),
++                    reference_valid_mask=self.sensor._robodojo_reference_surface_valid.to(device=height_map.device),
++                )
++            self.tactile_rgb_img[:] = tactile_rgb.movedim(1, 3)
++            return self.tactile_rgb_img
+ 
+         # only simulate in case of indentation
+         # self.tactile_rgb_img[self._indentation_depth <= 0][:] = self.background_img
+@@ -117,6 +145,8 @@
+         # )
+ 
+         self._indentation_depth[:] = -height_map.amin((1, 2))
++        if self.cfg.input_mode == "deformed_surface":
++            self._indentation_depth.clamp_(min=0)
+         return self._indentation_depth
+ 
+     def reset(self):
+diff --git a/source/tacex/tacex/simulation_approaches/gpu_taxim/taxim_sim_cfg.py b/source/tacex/tacex/simulation_approaches/gpu_taxim/taxim_sim_cfg.py
+--- a/source/tacex/tacex/simulation_approaches/gpu_taxim/taxim_sim_cfg.py
++++ b/source/tacex/tacex/simulation_approaches/gpu_taxim/taxim_sim_cfg.py
+@@ -19,6 +19,11 @@
+     device: str = "cuda"
+ 
+     with_shadow: bool = False
++
++    input_mode: str = "object"
++    """`object` approximates gel deformation; `deformed_surface` renders a
++    signed gel height field supplied by an external mechanics solver.
++    """
+ 
+     tactile_img_res: tuple = (320, 240)
+     """Resolution (width, height) of the Tactile Image.
+diff --git a/source/tacex/tacex/gelsight_sensor.py b/source/tacex/tacex/gelsight_sensor.py
+--- a/source/tacex/tacex/gelsight_sensor.py
++++ b/source/tacex/tacex/gelsight_sensor.py
+@@ -199,6 +199,18 @@
+ 
+         if "camera_depth" in self._data.output:
+             self._data.output["camera_depth"][env_ids] = 0
++
++        # A reset uses the reference normals for the selected environments.
++        # Cached absolute fields must not replay the preceding contact frame;
++        # other environments retain their current surface observations.
++        surface = getattr(self, "_robodojo_surface_height_mm", None)
++        reference = getattr(self, "_robodojo_reference_surface_height_mm", None)
++        if surface is not None and reference is not None:
++            surface[env_ids] = reference[env_ids]
++            current_valid = getattr(self, "_robodojo_surface_valid", None)
++            reference_valid = getattr(self, "_robodojo_reference_surface_valid", None)
++            if current_valid is not None and reference_valid is not None:
++                current_valid[env_ids] = reference_valid[env_ids]
+ 
+         # simulate optical/marker output, but without indentation
+         if (self.optical_simulator is not None) and ("tactile_rgb" in self._data.output):
+@@ -671,8 +683,24 @@
+         if nominal is not None:
+             depth = self.camera.data.output["depth"][..., 0]
+             valid = self._robodojo_nominal_mask & torch.isfinite(depth)
++            deformed_surface = getattr(self.cfg.optical_sim_cfg, "input_mode", "object") == "deformed_surface"
++            if deformed_surface:
++                near, far = self.cfg.sensor_camera_cfg.clipping_range
++                current_valid = torch.isfinite(depth) & (depth > near) & (depth < far - 1e-6)
++                reference_valid = self._robodojo_nominal_mask & torch.isfinite(nominal)
++                reference_valid = reference_valid & (nominal > near) & (nominal < far - 1e-6)
++                valid = current_valid & reference_valid
++                self._robodojo_depth_valid = valid
++                # Absolute heights share one origin. Subtracting this constant
++                # improves precision without removing the reference curvature.
++                self._robodojo_surface_height_mm = torch.where(current_valid, depth-near, 0.) * 1000.
++                self._robodojo_reference_surface_height_mm = torch.where(reference_valid, nominal-near, 0.) * 1000.
++                self._robodojo_surface_valid = current_valid
++                self._robodojo_reference_surface_valid = reference_valid
+             delta = torch.where(valid, depth-nominal, torch.zeros_like(depth))
+-            self._data.output["height_map"].copy_(delta.clamp(-self.cfg.gelpad_dimensions.height, 0.) * 1000.)
++            if not deformed_surface:
++                delta = delta.clamp(-self.cfg.gelpad_dimensions.height, 0.)
++            self._data.output["height_map"].copy_(delta * 1000.)
+             return self._data.output["height_map"]
+         if self.camera is not None:
+             self._data.output["height_map"][:] = self.camera.data.output["depth"][

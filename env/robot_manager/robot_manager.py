@@ -12,7 +12,6 @@ import transforms3d as t3d
 
 from env.environment.isaac.isaac_rl_env import IsaacRLEnv
 from env.global_configs import ENV_REGEX_NAMESPACE
-from env.planner_manager.curobo_planner import CuroboPlanner
 from env.robot_manager.control_manager import ControlManager, MetaControl
 from utils.ensure_usd_path import ensure_usd_path
 
@@ -346,10 +345,8 @@ class RobotManager:
     def restore_name(self, processed_name):
         if processed_name.endswith("_joint_state"):
             name = processed_name[:-12]
-            if name.startswith("ee"):
-                return "arm" + name[2:]
-            else:
-                return name
+            # Inverse of process_name: ee/ee0 are gripper names, not arms.
+            return name
         else:
             return processed_name
 
@@ -538,6 +535,11 @@ class RobotManager:
 
     def _setup_planner(self, robot):
         if robot.robot_type == "arm":
+            # CuRobo is only needed by tasks that request IK/motion planning.
+            # Keep robot/scene setup importable when the
+            # optional planner package is absent or uses a different API.
+            from env.planner_manager.curobo_planner import CuroboPlanner
+
             root_pose = deepcopy(robot.entity_origin_pose)
             self.planner[robot.robot_name] = CuroboPlanner(
                 robot_origin_pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
@@ -681,10 +683,15 @@ ROBOT_CLASS_REGISTRY = {
         "module": "x5",
         "classes": ("X5",),
     },
+    "x5_pad": {
+        "module": "x5",
+        "classes": ("X5",),
+    },
 }
 
 
 ROBOT_CONFIG_REGISTRY = {
     "franka": "franka",
     "x5": "x5",
+    "x5_pad": "x5_pad",
 }

@@ -7,10 +7,11 @@ export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/XPolicyLab:${PYTHONPATH:-}"
 echo "[INFO] PYTHONPATH=${PYTHONPATH}"
 
 # Usage:
-#   bash eval_policy.sh <task_name> <env_cfg_type> <device_id> <policy_name> <port> [extra-args...]
+#   bash scripts/eval_policy.sh --root_dir PATH --task_name TASK --env_cfg_type NAME \
+#     --device_id ID --policy_name NAME --port PORT [--gui | --headless]
 
 if [[ $# -lt 5 ]]; then
-  echo "usage: bash eval_policy.sh <task_name> <env_cfg_type> <device_id> <policy_name> <port> [extra-args...]" >&2
+  echo "usage: bash scripts/eval_policy.sh --root_dir PATH --task_name TASK --env_cfg_type NAME --device_id ID --policy_name NAME --port PORT [--gui | --headless]" >&2
   exit 1
 fi
 
@@ -26,11 +27,21 @@ seed=""
 host="localhost"
 protocol=""
 policy_server_url=""
+num_envs="${ROBODOJO_NUM_ENVS:-}"
+headless="${ROBODOJO_HEADLESS:-1}"
 extra_args=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --root_dir|--task_name|--env_cfg_type|--device_id|--policy_name|--port|--eval_batch|--additional_info|--seed|--host|--protocol|--policy_server_url)
+    --gui)
+      headless="0"
+      shift
+      ;;
+    --headless)
+      headless="1"
+      shift
+      ;;
+    --root_dir|--task_name|--env_cfg_type|--device_id|--policy_name|--port|--eval_batch|--additional_info|--seed|--host|--protocol|--policy_server_url|--num_envs|--num-envs)
       if [[ $# -lt 2 || "$2" == --* ]]; then
         echo "[ERROR] Missing value for argument: $1"
         exit 1
@@ -49,6 +60,13 @@ while [[ $# -gt 0 ]]; do
         --host) host="$2" ;;
         --protocol) protocol="$2" ;;
         --policy_server_url) policy_server_url="$2" ;;
+        --num_envs|--num-envs)
+          if [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+            echo "[ERROR] --num_envs must be a positive integer: $2" >&2
+            exit 2
+          fi
+          num_envs="$2"
+          ;;
       esac
       shift 2
       ;;
@@ -58,6 +76,27 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "${num_envs}" && ! "${num_envs}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[ERROR] ROBODOJO_NUM_ENVS must be a positive integer: ${num_envs}" >&2
+  exit 2
+fi
+
+case "${headless}" in
+  0)
+    # AppLauncher can otherwise inherit LIVESTREAM and force headless mode.
+    launcher_args=(--livestream 0)
+    ;;
+  1)
+    launcher_args=(--headless)
+    ;;
+  *)
+    echo "[ERROR] ROBODOJO_HEADLESS must be 0 or 1: ${headless}" >&2
+    exit 2
+    ;;
+esac
+export HEADLESS="${headless}"
+echo "[INFO] headless = ${headless}"
 
 for var_name in root_dir task_name env_cfg_type device_id policy_name port; do
   if [[ -z "${!var_name}" ]]; then
@@ -113,7 +152,9 @@ fi
 
 # Read render_interval / env.num_envs from yaml (fallback if missing)
 render_interval="$(python3 -c "import sys,yaml;print(yaml.safe_load(open(sys.argv[1])).get('render_interval',1))" "$sim_cfg_file")"
-num_envs="$(python3 -c "import sys,yaml;print(yaml.safe_load(open(sys.argv[1])).get('scene',{}).get('num_envs',1))" "$sim_cfg_file")"
+if [[ -z "${num_envs}" ]]; then
+  num_envs="$(python3 -c "import sys,yaml;print(yaml.safe_load(open(sys.argv[1])).get('scene',{}).get('num_envs',1))" "$sim_cfg_file")"
+fi
 
 echo "[INFO] render_interval = ${render_interval}"
 echo "[INFO] num_envs        = ${num_envs}"
@@ -157,7 +198,7 @@ while : ; do
     --additional_info "$additional_info" \
     --seed "$seed" \
     --host "$host" \
-    --headless \
+    "${launcher_args[@]}" \
     "${extra_args[@]}" \
     "$@"
   rc=$?

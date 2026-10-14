@@ -135,6 +135,13 @@ class BaseEnv(gym.Env):
 
         self.setup_sim_cfg(config)
 
+        # Kit enables PhysX Fabric and disables USD updates independently of
+        # Isaac Lab's configuration. Select the matching publication path so
+        # CPU environments with use_fabric=False still render moving bodies.
+        from isaacsim.core.simulation_manager import SimulationManager
+
+        SimulationManager.enable_fabric(self.sim_cfg.sim.use_fabric)
+
         import traceback
 
         try:

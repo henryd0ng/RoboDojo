@@ -8,6 +8,7 @@
 | [install.sh](install.sh) | One-time environment setup (conda, Isaac Sim, submodules) |
 | [init_assets.sh](init_assets.sh) | Download robot/object assets |
 | [eval_policy.sh](eval_policy.sh) | Isaac Sim eval client (called by `robodojo.sh client` and XPolicyLab) |
+| [install_tactile.sh](install_tactile.sh) | Install the RoboDojo-local optional TacEx packages without replacing the Isaac stack |
 
 ## Typical eval flow
 
@@ -21,6 +22,23 @@ Split / multi-machine (see docs/SPLIT_EVAL.md):
 robodojo.sh server  ->  scripts/internal/run_policy_server.sh  ->  policy server (bind 0.0.0.0)
 robodojo.sh client  ->  scripts/eval_policy.sh  ->  src/eval_client/main.py
 ```
+
+Single-task `eval` and `client` run headless by default. Add `--gui` to open
+the Isaac Sim window, or `--headless` to select the default explicitly.
+The same flags work with ordinary and tactile environment presets.
+
+Use `--num-envs 1` with `eval` or `client` to run one simulation environment.
+Omitting it preserves the existing policy and simulator defaults;
+`--eval-num` independently limits the number of evaluated episodes.
+
+```bash
+bash scripts/robodojo.sh client \
+  --task plug_in_charger --policy-name demo_policy \
+  --policy-host 127.0.0.1 --policy-port 9000 \
+  --env-cfg arx_x5_pad_tactile --action-type ee --num-envs 1 --eval-num 1
+```
+
+For the paired tactile controller/client commands, see [the three-task demo](../tests/tactile/integration/README.md).
 
 Run one or more official capability dimensions in a benchmark sweep:
 
@@ -50,7 +68,7 @@ Dry-run example:
 
 ```bash
 bash scripts/robodojo.sh benchmark \
-  --policy-dir XPolicyLab/policy/ACT \
+  --policy-dir XPolicyLab/policy/demo_policy \
   --ckpt test_ckpt \
   --policy-env RoboDojo \
   --eval-num 1 \
@@ -62,7 +80,7 @@ Launch only a subset of tasks:
 
 ```bash
 bash scripts/robodojo.sh benchmark \
-  --policy-dir XPolicyLab/policy/ACT \
+  --policy-dir XPolicyLab/policy/demo_policy \
   --ckpt test_ckpt \
   --policy-env RoboDojo \
   --eval-num native \

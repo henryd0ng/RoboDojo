@@ -53,6 +53,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
         def __init__(self, config, app, resume_state=None, **kwargs):
             super().__init__(config, app, **kwargs)
             self.eval_cfg = config.eval_cfg
+            self.original_step_lim = int(self.step_lim)
+            self.step_lim = min(self.original_step_lim, self.eval_cfg.get("max_actions", self.original_step_lim))
             self.config_name = self.eval_cfg.get("config_name", None)
             self.task_name = self.eval_cfg.get("task_name", None)
             self.eval_batch = self.eval_cfg.get("eval_batch", False)
@@ -77,8 +79,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                 os.environ["ROBODOJO_RUN_ID"] = run_id
             self.run_id = run_id
+            self.output_root = self.eval_cfg.get("output_root", "eval_result")
             self.save_dir = os.path.join(
-                "eval_result",
+                self.output_root,
                 f"{BENCHMARK}",
                 self.task_name,
                 self.policy_name,
@@ -118,6 +121,11 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             # Replaces the old full-episode frame cache; only vision frames are
             # streamed to disk as they arrive instead of buffered in RAM.
             self.video_writers: dict[int, dict[str, VideoStreamWriter]] = {}
+            self.video_mosaic = None
+            if self.obs_config.get("video_mosaic", self.tactile_manager.enabled):
+                from utils.tactile_video import TactileVideoMosaic
+
+                self.video_mosaic = TactileVideoMosaic()
             self.episode_nums = self.num_envs
             self.unstable_nums = 0
             self.unstable_envs: set[int] = set()
@@ -197,9 +205,19 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.robot_action_dim_info = get_robot_action_dim_info(env_cfg=self.eval_cfg)
 
         def close(self):
-            self._abort_video_writers()
-            self.obs_manager.reset()
-            super().close()
+            operations = [self._abort_video_writers, self.obs_manager.reset, super().close]
+            errors = []
+            for operation in operations:
+                try:
+                    operation()
+                except BaseException as error:
+                    # Attempt every cleanup even if a camera or physics
+                    # resource fails to close.
+                    errors.append(error)
+            if len(errors) == 1:
+                raise errors[0]
+            if errors:
+                raise BaseExceptionGroup("Evaluation cleanup failed", errors)
 
         def _post_setup_scene(self, sim):
             super()._post_setup_scene(sim)
@@ -244,8 +262,12 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
 
             self.model_client.call(func_name="reset")
 
+        def _prepare_tactile_reset(self):
+            """Defer ownership until evaluation's native reset has completed."""
+
         def setup_scene(self):
-            self.scene_manager.apply_saved_poses(env_idx_list=list(range(self.num_envs)))
+            if not self.tactile_manager.enabled or not self.tactile_manager.initialized:
+                self.scene_manager.apply_saved_poses(env_idx_list=list(range(self.num_envs)))
             self._align_layout_success()
             success, unstable_envs = self.scene_manager.layout_manager.check_layout_stability(self)
             unstable_envs = [idx for idx in set(unstable_envs) if idx < self.num_envs]
@@ -262,6 +284,14 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     self.obs_manager.get_obs()
             if self.physx_monitor_enabled:
                 self._check_physx_broken_envs()
+            if self.tactile_manager.enabled and not self.tactile_manager.initialized:
+                self._initialize_tactile_from_native_scene()
+                self.tactile_manager.resume()
+                print(f"[RoboDojo tactile] settling {self.tactile_manager.config.stabilise_steps} "
+                      "UIPC physics steps after native reset", flush=True)
+                for _ in range(self.tactile_manager.config.stabilise_steps):
+                    self.sim_step(render=False)
+                self._calibrate_tactile_reference()
 
         def get_obs(self):
             return self.get_obs_batch(env_idx_list=[0])[0]
@@ -278,7 +308,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             data_list = []
             for env_idx in env_idx_list:
                 if not self.end_flag[env_idx] or last_frame:
-                    self._stream_vision(env_idx, data[env_idx])
+                    self._stream_videos(env_idx, data[env_idx])
                 env_data = deepcopy(data[env_idx])
                 env_data["env_idx"] = env_idx
                 data_list.append(env_data)
@@ -659,7 +689,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             locate by humans.
             """
             return os.path.join(
-                "eval_result",
+                self.output_root,
                 f"{BENCHMARK}",
                 self.task_name,
                 self.policy_name,
@@ -869,18 +899,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
         def get_running_env_idx_list(self):
             return [idx for idx in range(self.num_envs) if not self.end_flag[idx]]
 
-        def _stream_vision(self, env_idx, frame):
-            """Append this env's per-camera RGB frames to its ffmpeg streams.
-
-            Only the vision ("color") data is recorded; writers are created
-            lazily on the first frame (when the resolution is known) and write
-            to temporary files until the episode outcome decides the name.
-            """
-            vision = frame.get("vision") if isinstance(frame, dict) else None
-            if not vision:
-                return
-            writers = self.video_writers.setdefault(env_idx, {})
-            fps = self.obs_manager.collect_freq
+        def _stream_videos(self, env_idx, frame):
+            """Record cameras and the optional mosaic from the same observation."""
+            vision = frame.get("vision", {})
             for cam_key, cam_data in vision.items():
                 color = cam_data.get("color") if isinstance(cam_data, dict) else None
                 if color is None:
@@ -888,11 +909,20 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 color = np.ascontiguousarray(color)
                 if color.ndim != 3 or color.shape[2] not in (3, 4):
                     continue
-                if cam_key not in writers:
-                    height, width, channels = color.shape
-                    tmp_path = os.path.join(self._stream_dir, f"env{env_idx}_{cam_key}.tmp.mp4")
-                    writers[cam_key] = VideoStreamWriter(tmp_path, height, width, channels, fps=fps)
-                writers[cam_key].append(color)
+                self._append_video_frame(env_idx, cam_key, color)
+            if self.video_mosaic is not None:
+                self._append_video_frame(env_idx, "visuotactile", self.video_mosaic.compose(frame))
+
+        def _append_video_frame(self, env_idx, key, color):
+            """Create a stream lazily; finalize it with the episode's outcome."""
+            writers = self.video_writers.setdefault(env_idx, {})
+            if key not in writers:
+                height, width, channels = color.shape
+                tmp_path = os.path.join(self._stream_dir, f"env{env_idx}_{key}.tmp.mp4")
+                writers[key] = VideoStreamWriter(
+                    tmp_path, height, width, channels, fps=self.obs_manager.collect_freq,
+                )
+            writers[key].append(color)
 
         def _sweep_stream_dir(self):
             """Remove orphan temp videos left by a previous hard kill/crash."""
@@ -940,6 +970,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                         writer.fps,
                     )
                 )
+
 
         def have_empty(self, env_idx_list=None):
             if env_idx_list is None:
